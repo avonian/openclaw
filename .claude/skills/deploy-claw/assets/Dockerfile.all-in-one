@@ -1,0 +1,93 @@
+# Stage 1: Copy built OpenClaw app from existing image
+ARG OPENCLAW_IMAGE=openclaw:local
+FROM ${OPENCLAW_IMAGE} AS openclaw-build
+
+# Stage 2: All-in-one runtime
+FROM node:22-bookworm
+
+# ── System packages ──────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      supervisor \
+      chromium \
+      fonts-liberation \
+      fonts-noto-color-emoji \
+      python3 \
+      python3-venv \
+      python3-pip \
+      curl \
+      gnupg \
+      jq \
+      wget \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# ── Neo4j 5 Community via official apt repo ──────────────────────────
+RUN curl -fsSL https://debian.neo4j.com/neotechnology.gpg.key \
+      | gpg --dearmor -o /usr/share/keyrings/neo4j-archive-keyring.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/neo4j-archive-keyring.gpg] https://debian.neo4j.com stable 5" \
+      > /etc/apt/sources.list.d/neo4j.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends neo4j \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# ── APOC plugin ──────────────────────────────────────────────────────
+RUN NEO4J_VERSION=$(neo4j --version | sed 's/neo4j //') \
+    && APOC_VERSION=$(echo "$NEO4J_VERSION" | grep -oP '^\d+\.\d+\.\d+') \
+    && wget -q -O /var/lib/neo4j/plugins/apoc-core.jar \
+      "https://github.com/neo4j/apoc/releases/download/${APOC_VERSION}/apoc-${APOC_VERSION}-core.jar"
+
+# Configure Neo4j to listen on localhost only (internal to container)
+RUN sed -i 's/^#\?server\.default_listen_address=.*/server.default_listen_address=127.0.0.1/' \
+      /etc/neo4j/neo4j.conf \
+    && echo "server.http.listen_address=0.0.0.0:7474" >> /etc/neo4j/neo4j.conf \
+    && echo "server.bolt.listen_address=0.0.0.0:7687" >> /etc/neo4j/neo4j.conf \
+    && echo "dbms.security.procedures.unrestricted=apoc.*" >> /etc/neo4j/neo4j.conf \
+    && echo "dbms.security.procedures.allowlist=apoc.*" >> /etc/neo4j/neo4j.conf
+
+# Ensure neo4j user owns its directories
+RUN chown -R neo4j:neo4j /var/lib/neo4j /var/log/neo4j /etc/neo4j
+
+# ── Graphiti API (Python) ────────────────────────────────────────────
+ARG GRAPHITI_VERSION=v0.5.2
+
+RUN python3 -m venv /opt/graphiti/venv \
+    && /opt/graphiti/venv/bin/pip install --no-cache-dir \
+      graphiti-core uvicorn fastapi pydantic-settings
+
+RUN mkdir -p /opt/graphiti/src \
+    && wget -q -O /tmp/graphiti.tar.gz \
+      "https://github.com/getzep/graphiti/archive/refs/tags/${GRAPHITI_VERSION}.tar.gz" \
+    && tar -xzf /tmp/graphiti.tar.gz -C /tmp \
+    && cp -r /tmp/graphiti-*/server/* /opt/graphiti/src/ \
+    && rm -rf /tmp/graphiti* \
+    && chown -R node:node /opt/graphiti
+
+# Patch: fix async worker client lifecycle bug in Graphiti server
+COPY .claude/skills/deploy-claw/assets/patch-graphiti-ingest.py /tmp/patch-graphiti-ingest.py
+COPY .claude/skills/deploy-claw/assets/patch-graphiti-init.py /tmp/patch-graphiti-init.py
+RUN python3 /tmp/patch-graphiti-ingest.py && python3 /tmp/patch-graphiti-init.py \
+    && rm /tmp/patch-graphiti-ingest.py /tmp/patch-graphiti-init.py
+
+# ── OpenClaw app ─────────────────────────────────────────────────────
+COPY --from=openclaw-build /app /home/node/app
+
+# ── Startup scripts ──────────────────────────────────────────────────
+COPY .claude/skills/deploy-claw/assets/start-neo4j.sh /usr/local/bin/start-neo4j.sh
+COPY .claude/skills/deploy-claw/assets/wait-for-neo4j.sh /usr/local/bin/wait-for-neo4j.sh
+RUN chmod +x /usr/local/bin/start-neo4j.sh /usr/local/bin/wait-for-neo4j.sh
+
+# ── Supervisord config ──────────────────────────────────────────────
+COPY .claude/skills/deploy-claw/assets/supervisord.conf /etc/supervisor/conf.d/openclaw.conf
+
+# ── Environment defaults ─────────────────────────────────────────────
+ENV CHROME_PATH=/usr/bin/chromium \
+    HOME=/home/node \
+    TERM=xterm-256color \
+    NEO4J_URI=bolt://127.0.0.1:7687 \
+    NEO4J_USER=neo4j \
+    GRAPHITI_URL=http://127.0.0.1:8000
+
+WORKDIR /home/node/app
+
+EXPOSE 18789
+
+CMD ["supervisord", "-n", "-c", "/etc/supervisor/conf.d/openclaw.conf"]

@@ -1,7 +1,10 @@
 node_modules
 **/node_modules/
 .env
+.env.*
 docker-compose.extra.yml
+docker-compose.*.yml
+!.claude/skills/deploy-claw/assets/docker-compose.team.yml
 dist
 pnpm-lock.yaml
 bun.lock

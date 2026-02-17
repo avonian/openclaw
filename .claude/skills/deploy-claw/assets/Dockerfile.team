@@ -1,0 +1,16 @@
+ARG OPENCLAW_IMAGE=openclaw:local
+FROM ${OPENCLAW_IMAGE}
+
+USER root
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    chromium \
+    fonts-liberation \
+    fonts-noto-color-emoji \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/*
+
+ENV CHROME_PATH=/usr/bin/chromium
+
+USER node
